@@ -6,11 +6,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.utils import shuffle
 from sklearn.metrics import classification_report
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import LeaveOneOut, GridSearchCV, KFold
-
+from sklearn.model_selection import LeaveOneOut, GridSearchCV, KFold, StratifiedKFold
+from sklearn.feature_selection import SequentialFeatureSelector
 import umap
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+from sklearn.metrics import confusion_matrix
 
 
 def load_and_preprocess_data():
@@ -56,6 +57,7 @@ def load_and_preprocess_data():
     ratio.name = "ratio"
     cov.name = "coverage"
     return uniqcounts, samplemap, sig, ratio, cov
+
 
 def train_test(samplemap, include_hn=True):
     """
@@ -157,31 +159,65 @@ def train_test_custom(
     ]
     return train_samples, test_samples
 
-def refit_strategy(cv_results):
-    """Custom strategy to pick best model during GridSearchCV
-    We chose the model with  overall best precision, recall and f1
 
-    Args:
-        cv_results (_type_): cv_results_ attribute from GridSearchCV
+def refit_strategy_loo(cv_results):
+    df = pd.DataFrame(cv_results)
+    all_conf_matrices = {}
+    F1_scores = np.empty(len(df.index))
+    # very unstable way to fetch the number of splits,
+    # but didnt really know how to do it otherwise without complicating
+    # the code too much, since this function is only allowed to take
+    # cv_results as input
+    n_splits = len(df.filter(regex=r"(split.*_tn)").columns)
+    print(f"number of splits {n_splits}")
+    for index in df.index:
+        conf_matrix = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
+        for split in range(n_splits):
+            for key in conf_matrix:
+                column_name = "split" + str(split) + "_test_" + key
+                conf_matrix[key] += df.loc[index, column_name]
+        all_conf_matrices[index] = conf_matrix
+        F1_scores[index] = (
+            2
+            * conf_matrix["tp"]
+            / (2 * conf_matrix["tp"] + conf_matrix["fp"] + conf_matrix["fn"])
+        )
+    return np.argmax(F1_scores)
 
-    Returns:
-       int : index of best model in results dataframe 
-    """
-    return (
-        pd.DataFrame(cv_results)[
-            ["rank_test_f1_macro", "rank_test_recall", "rank_test_precision"]
-        ]
-        .sum(axis=1)
-        .argmin()
-    )
+
+def confusion_matrix_scorer(clf, X, y):
+    y_pred = clf.predict(X)
+    cm = confusion_matrix(y, y_pred, labels=[0, 1])
+    return {"tn": cm[0, 0], "fp": cm[0, 1], "fn": cm[1, 0], "tp": cm[1, 1]}
+
+
+# def refit_strategy_kfold(cv_results):
+#     """Custom strategy to pick best model during GridSearchCV
+#     We chose the model with  overall best precision, recall and f1
+
+#     Args:
+#         cv_results (_type_): cv_results_ attribute from GridSearchCV
+
+#     Returns:
+#        int : index of best model in results dataframe
+#     """
+#     return (
+#         pd.DataFrame(cv_results)[
+#             ["rank_test_f1_macro", "rank_test_recall", "rank_test_precision"]
+#         ]
+#         .sum(axis=1)
+#         .argmin()
+#     )
 
 
 def pipeline(
     features: pd.DataFrame,
     train_samples: pd.DataFrame,
     test_samples: pd.DataFrame,
-    parameters = {"C": [0.1, 1, 5, 6, 7, 8, 9, 10, 20, 30, 40, 100]},
+    search_strategy="llo",
+    parameters={"C": [0.1, 1, 5, 6, 7, 8, 9, 10, 20, 30, 40, 100]},
 ) -> list:
+
     """Whole train, tune, refit, and plot pipeline
 
     Args:
@@ -211,24 +247,45 @@ def pipeline(
         X_train_scaled, y_train, random_state=seed
     )
     # Find optimal parameters on train using grid search cv
-    # clf = GridSearchCV(LogisticRegression(penalty = 'l1', max_iter = 10000, solver = 'liblinear', class_weight = 'balanced'), param_grid=parameters, cv = KFold(n_splits = 10), scoring = 'f1_macro')
+    # clf = GridSearchCV(LogisticRegression(penalty = 'l1', max_iter = 10000, solver = 'liblinear', class_weight = 'balanced'), param_grid=parameters, cv = StratifiedKFold(n_splits = 10), scoring = 'f1_macro')
+    if search_strategy == "llo":
+        clf = GridSearchCV(
+            LogisticRegression(
+                penalty="l1",
+                max_iter=10000,
+                solver="liblinear",
+                class_weight="balanced",
+            ),
+            param_grid=parameters,
+            cv=LeaveOneOut(),
+            refit=refit_strategy_loo,
+            scoring=confusion_matrix_scorer,
+        )
+    else:
+        clf = GridSearchCV(
+            LogisticRegression(
+                penalty="l1",
+                max_iter=10000,
+                solver="liblinear",
+                class_weight="balanced",
+            ),
+            param_grid=parameters,
+            cv=KFold(n_splits=5),
+            scoring="f1_macro",
+        )
 
-    clf = GridSearchCV(
-        LogisticRegression(
-            penalty="l1", max_iter=10000, solver="liblinear", class_weight="balanced"
-        ),
-        param_grid=parameters,
-        cv=LeaveOneOut(),
-        refit=refit_strategy,
-        scoring=["precision", "recall", "f1_macro"],
-    )
     clf.fit(X_train_shuffled, y_train_shuffled)
     # best algorithm (already refitted on whole train set)
     best = clf.best_estimator_
     print(f"best parameters {clf.best_params_}")
     print(f"Number of nonzero coeffs {len(best.coef_.squeeze().nonzero()[0])}")
     print(f"Kept features {train_features.columns[best.coef_.squeeze().nonzero()[0]]}")
+    # compute metrics on train
+    y_pred_train = best.predict(X_train_shuffled)
+    print(f"Metrics on train")
+    print(classification_report(y_train_shuffled, y_pred_train))
     # predict on test
+    print(f"Metrics on test")
     y_pred_test = best.predict(X_test_scaled)
     print(classification_report(y_test, y_pred_test))
     # probabilities on test and train
@@ -248,14 +305,77 @@ def pipeline(
         plt.title(f"Using {features.name}, {title} subset")
     return train_features.columns[best.coef_.squeeze().nonzero()[0]]
 
+def pipeline_sequ_selection(features, train_samples, test_samples, forward=True):
+    seed = 0
+    # select train and test features
+    train_features = features.loc[train_samples.index]
+    test_features = features.loc[test_samples.index]
+    print(f"Initially using {len(train_features.columns)} features")
+    # convert to numpy array
+    X_train = train_features.values
+    y_train = train_samples.labels.values
+    X_test = test_features.values
+    y_test = test_samples.labels.values
+    # scale train and test
+    scaler = StandardScaler().fit(X_train)
+    X_train_scaled, X_test_scaled = scaler.transform(X_train), scaler.transform(X_test)
+    # shuffle training features
+    X_train_shuffled, y_train_shuffled = shuffle(
+        X_train_scaled, y_train, random_state=seed
+    )
+    # algorithm to perform feature selection (and also final model fitting in our case)
+    alg = LogisticRegression(
+        max_iter=10000, solver="liblinear", class_weight="balanced"
+    )
+    
+    direction = "forward" if forward else "backward"
+    # greedy feature selection
+    sfs = SequentialFeatureSelector(
+        alg,
+        scoring="f1_macro",
+        direction=direction,
+        cv=StratifiedKFold(n_splits = 7),
+        n_features_to_select="auto",
+        tol=0.001,
+    )
+    # finf the features and transform to get new X, containg only the selected features
+    X_train_reduced = sfs.fit_transform(X_train_shuffled, y_train_shuffled)
+    X_test_reduced = sfs.transform(X_test_scaled)
+    print(
+        f"keeping {len(sfs.get_feature_names_out(features.columns))} features : {sfs.get_feature_names_out(features.columns)}"
+    )
+    # train our model using the selected features
+    best = alg.fit(X_train_reduced, y_train_shuffled)
+    # compute metrics on train
+    y_pred_train = best.predict(X_train_reduced)
+    print(f"Metrics on train")
+    print(classification_report(y_train_shuffled, y_pred_train))
+    # predict on test
+    print(f"Metrics on test")
+    y_pred_test = best.predict(X_test_reduced)
+    print(classification_report(y_test, y_pred_test))
+    # probabilities on test and train
+    # make the plots
+    for X, samples, title in zip(
+        (X_test_reduced, X_train_reduced),
+        (test_samples, train_samples),
+        ("Test samples", "Train samples"),
+    ):
+        prob_healthy = best.predict_proba(X)[:, 1]
+        predicted_probas = samples.copy()
+        predicted_probas["proba_healthy"] = np.round_(prob_healthy, 2)
+        plt.figure(figsize=(20, 10))
+        plt.bar(predicted_probas.index, predicted_probas.proba_healthy)
+        _ = plt.xticks(rotation=90)
+        plt.ylabel("Probability of healthy")
+        plt.title(f"Using {features.name}, {title} subset")
 
 def concat_features(df_list):
     return pd.concat(df_list, axis=1)
 
 
 def get_embeddings(uniqcounts, ratio, cov, sig):
-    """compute some embeddings
-    """
+    """compute some embeddings"""
     algo_umap = umap.UMAP(random_state=42)
     algo_tsne = TSNE(n_components=2, random_state=42)
     algo_pca = PCA(n_components=2, random_state=42)
@@ -292,6 +412,3 @@ def get_embeddings(uniqcounts, ratio, cov, sig):
         embed_uniq_pca,
         embed_sig_pca,
     )
-
-
-
