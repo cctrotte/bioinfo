@@ -224,6 +224,7 @@ def pipeline(
         features (pd.DataFrame): features
         train_samples (pd.DataFrame): train samples
         test_samples (pd.DataFrame): test samples
+        search_strategy (str): CV strategy. Defaults to "llo"
         parameters (dict, optional): Dictionary of parameters to try out during the GridsearchCV. Defaults to {"C": [0.1, 1, 5, 6, 7, 8, 9, 10, 20, 30, 40, 100]}.
 
     Returns:
@@ -270,7 +271,7 @@ def pipeline(
                 class_weight="balanced",
             ),
             param_grid=parameters,
-            cv=KFold(n_splits=5),
+            cv=StratifiedKFold(n_splits=5),
             scoring="f1_macro",
         )
 
